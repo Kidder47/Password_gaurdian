@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   ShieldCheck,
   ShieldAlert,
@@ -16,6 +16,9 @@ import {
   CheckCircle2,
   Info,
   X,
+  Zap,
+  Download,
+  UserCheck,
 } from "lucide-react";
 
 // ---- Data ----
@@ -28,6 +31,29 @@ const COMMON_PASSWORDS = new Set([
 const LEET_MAP = {
   a: "4", e: "3", i: "1", o: "0", s: "5", t: "7",
 };
+
+// ---- Shared common-password pattern detection ----
+// Real attackers don't just brute-force randomly — they run dictionary +
+// rule-based attacks first (common word, common word + digits, leetspeak
+// swaps, etc). This catches those patterns, not just exact matches, so
+// something like "password123" is correctly flagged even though the exact
+// string isn't in the raw list.
+function isCommonPasswordPattern(pw) {
+  const lower = pw.toLowerCase();
+  if (COMMON_PASSWORDS.has(lower)) return true;
+
+  const undoLeet = lower
+    .replace(/4/g, "a").replace(/3/g, "e").replace(/1/g, "i")
+    .replace(/0/g, "o").replace(/5/g, "s").replace(/7/g, "t");
+  if (COMMON_PASSWORDS.has(undoLeet)) return true;
+
+  // Strip digits/symbols to catch "password123", "password!", "123password", etc
+  const stripped = lower.replace(/[^a-z]/g, "");
+  const strippedLeet = undoLeet.replace(/[^a-z]/g, "");
+  if (COMMON_PASSWORDS.has(stripped) || COMMON_PASSWORDS.has(strippedLeet)) return true;
+
+  return false;
+}
 
 // ---- Scoring logic ----
 // Score is now derived from entropy (bits of randomness), the same math
@@ -76,9 +102,6 @@ function scorePassword(pw) {
 
   // --- Hard penalties for predictable patterns brute-force math doesn't capture ---
   const lower = pw.toLowerCase();
-  const undoLeet = lower
-    .replace(/4/g, "a").replace(/3/g, "e").replace(/1/g, "i")
-    .replace(/0/g, "o").replace(/5/g, "s").replace(/7/g, "t");
 
   let capReason = null;
 
@@ -86,10 +109,10 @@ function scorePassword(pw) {
     score = 1;
     capReason = "Exact match with a known common password";
     feedback.push("This is one of the most commonly used passwords");
-  } else if (COMMON_PASSWORDS.has(undoLeet)) {
+  } else if (isCommonPasswordPattern(pw)) {
     score = Math.min(score, 2);
-    capReason = "Leetspeak version of a common password";
-    feedback.push("Leetspeak version of a common word — attackers check for this too");
+    capReason = "Based on a common password (with digits, symbols, or leetspeak swapped in)";
+    feedback.push("This is a common password with minor changes — attackers check for this pattern");
   }
 
   if (/(.)\1{2,}/.test(pw)) {
@@ -221,6 +244,46 @@ function suggestPassphrases(count = 3) {
   return Array.from(phrases);
 }
 
+// ---- Personal info collision detection ----
+// Checks whether the password contains any personal info the user optionally
+// provides (name, birth year, pet name, etc). This catches one of the most
+// common real-world weaknesses that pure entropy math can't detect on its own.
+function checkPersonalInfoCollisions(pw, personalInfo) {
+  if (!pw) return [];
+  const lower = pw.toLowerCase();
+  const matches = [];
+
+  for (const [label, value] of Object.entries(personalInfo)) {
+    const trimmed = value.trim();
+    if (trimmed.length >= 2 && lower.includes(trimmed.toLowerCase())) {
+      matches.push(label);
+    }
+  }
+
+  return matches;
+}
+
+// ---- Number formatting for the attack simulator ----
+// Turns huge combination counts into readable text (e.g. "4.2 trillion")
+// instead of a raw string of digits that's impossible to read at a glance.
+function formatGuessCount(n) {
+  if (n < 1000) return Math.round(n).toLocaleString();
+
+  const units = ["", "thousand", "million", "billion", "trillion", "quadrillion", "quintillion", "sextillion"];
+  let unitIndex = 0;
+  let val = n;
+  while (val >= 1000 && unitIndex < units.length - 1) {
+    val /= 1000;
+    unitIndex++;
+  }
+
+  if (unitIndex >= units.length - 1 && val >= 1000) {
+    return n.toExponential(2);
+  }
+
+  return `${val.toFixed(val < 10 ? 1 : 0)} ${units[unitIndex]}`.trim();
+}
+
 // ---- Crack time estimation ----
 // NOTE: This is a theoretical estimate based on entropy math, not real
 // breach data. It assumes a fast OFFLINE attack (~10 billion guesses/sec)
@@ -244,10 +307,7 @@ function estimateCrackTime(pw) {
   let seconds = combinations / guessesPerSecond;
 
   const lower = pw.toLowerCase();
-  const undoLeet = lower
-    .replace(/4/g, "a").replace(/3/g, "e").replace(/1/g, "i")
-    .replace(/0/g, "o").replace(/5/g, "s").replace(/7/g, "t");
-  const isDictionaryHit = COMMON_PASSWORDS.has(lower) || COMMON_PASSWORDS.has(undoLeet);
+  const isDictionaryHit = isCommonPasswordPattern(pw);
   if (isDictionaryHit) {
     seconds = 0.001;
   }
@@ -266,7 +326,7 @@ function estimateCrackTime(pw) {
     else display = `${Math.round(years / 1_000_000_000)} billion years`;
   }
 
-  return { display, poolSize, entropyBits, guessesPerSecond, isDictionaryHit };
+  return { display, poolSize, entropyBits, guessesPerSecond, isDictionaryHit, combinations };
 }
 
 // ---- Strength label + color helpers ----
@@ -294,11 +354,24 @@ export default function App() {
   const [showSuggestionInfo, setShowSuggestionInfo] = useState(false);
   const [lastImprovement, setLastImprovement] = useState(null); // { from, to }
   const [suggestionMode, setSuggestionMode] = useState("leet"); // "leet" | "passphrase"
+  const [showPersonalInfo, setShowPersonalInfo] = useState(false);
+  const [personalInfo, setPersonalInfo] = useState({
+    "Name": "",
+    "Birth year": "",
+    "Pet/nickname": "",
+  });
+  const [attackRunning, setAttackRunning] = useState(false);
+  const [attackGuesses, setAttackGuesses] = useState(0);
+  const [attackResult, setAttackResult] = useState(null); // "cracked" | "survived" | null
 
-  const { score, feedback, breakdown } = scorePassword(password);
+  const { score: baseScore, feedback, breakdown } = scorePassword(password);
+  const personalMatches = checkPersonalInfoCollisions(password, personalInfo);
+  const score = personalMatches.length > 0 ? Math.min(baseScore, 3) : baseScore;
   const meta = getStrengthMeta(score);
   const StrengthIcon = meta.icon;
-  const crackInfo = estimateCrackTime(password);
+  const crackInfo = personalMatches.length > 0
+    ? { ...estimateCrackTime(password), display: "Instantly", isDictionaryHit: true }
+    : estimateCrackTime(password);
 
   function regenerateSuggestions(pw) {
     setSuggestions(
@@ -311,6 +384,7 @@ export default function App() {
     setPassword(value);
     regenerateSuggestions(value);
     setLastImprovement(null);
+    stopAttackSimulation();
   }
 
   function applySuggestion(suggestion) {
@@ -320,6 +394,7 @@ export default function App() {
     setPassword(suggestion);
     regenerateSuggestions(suggestion);
     setLastImprovement({ from: beforeScore, to: afterScore });
+    stopAttackSimulation();
   }
 
   function switchSuggestionMode(mode) {
@@ -355,12 +430,126 @@ export default function App() {
     setTimeout(() => setCopied(null), 1500);
   }
 
+  function generateReport() {
+    if (!password) return;
+
+    const timestamp = new Date().toLocaleString();
+    const lines = [
+      "PASSWORD GUARDIAN — SECURITY REPORT",
+      `Generated: ${timestamp}`,
+      "",
+      "Note: The actual password is NOT included in this report for your safety.",
+      "",
+      `Strength score: ${score}/10 (${meta.label})`,
+      `Estimated time to crack: ${crackInfo.display}`,
+      `Password length: ${password.length} characters`,
+      `Character types used: ${[
+        /[a-z]/.test(password) && "lowercase",
+        /[A-Z]/.test(password) && "uppercase",
+        /[0-9]/.test(password) && "numbers",
+        /[^a-zA-Z0-9]/.test(password) && "symbols",
+      ].filter(Boolean).join(", ") || "none"}`,
+      "",
+      "Feedback:",
+      ...feedback.map((f) => `  - ${f}`),
+    ];
+
+    if (personalMatches.length > 0) {
+      lines.push("", `Warning: contains personal info you flagged (${personalMatches.join(", ")})`);
+    }
+
+    lines.push(
+      "",
+      "---",
+      "This estimate is a simplified educational model, not real breach data.",
+      "Generated entirely in your browser — nothing was sent to a server.",
+    );
+
+    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `password-guardian-report-${Date.now()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   function clearPassword() {
     setPassword("");
     setSuggestions([]);
     setHistory([]);
     setLastImprovement(null);
+    stopAttackSimulation();
   }
+
+  const attackIntervalRef = useRef(null);
+
+  function stopAttackSimulation() {
+    if (attackIntervalRef.current) {
+      clearInterval(attackIntervalRef.current);
+      attackIntervalRef.current = null;
+    }
+    setAttackRunning(false);
+    setAttackGuesses(0);
+    setAttackResult(null);
+  }
+
+  // Runs a visual (time-compressed) simulation of a brute-force attack.
+  // The counter animates rapidly regardless of actual password strength —
+  // what differs is whether it lands on "cracked" or "still secure" at the
+  // end, based on the real crack-time estimate. This is a demonstration,
+  // not a real attack — it never tries to actually guess anything.
+  function runAttackSimulation() {
+    if (!password) return;
+    stopAttackSimulation();
+
+    const rawInfo = estimateCrackTime(password);
+    const info = personalMatches.length > 0
+      ? { ...rawInfo, display: "Instantly", isDictionaryHit: true }
+      : rawInfo;
+    const willCrack = info.isDictionaryHit || info.display.includes("second") ||
+      info.display.includes("minute") || info.display.includes("hour") || info.display === "Instantly";
+
+    // Target guess count: for dictionary hits, attackers find it almost
+    // immediately from a wordlist (not by counting through combinations),
+    // so use a small realistic number instead of the full brute-force space.
+    // Otherwise, ramp toward the ACTUAL number of combinations this password
+    // requires — so the animation reflects this specific password, not a
+    // fixed generic number.
+    const target = info.isDictionaryHit
+      ? Math.floor(50 + Math.random() * 2000)
+      : Math.max(info.combinations, 10);
+    const logTarget = Math.log10(target);
+
+    setAttackRunning(true);
+    setAttackResult(null);
+    const durationMs = 2500;
+    const stepMs = 40;
+    const steps = durationMs / stepMs;
+    let step = 0;
+
+    attackIntervalRef.current = setInterval(() => {
+      step++;
+      // Ramp exponentially in log space so it visually accelerates, but
+      // lands exactly on the real target guess count at the end
+      const count = Math.floor(Math.pow(10, logTarget * (step / steps)));
+      setAttackGuesses(count);
+
+      if (step >= steps) {
+        clearInterval(attackIntervalRef.current);
+        attackIntervalRef.current = null;
+        setAttackRunning(false);
+        setAttackGuesses(target);
+        setAttackResult(willCrack ? "cracked" : "survived");
+      }
+    }, stepMs);
+  }
+
+  useEffect(() => {
+    return () => stopAttackSimulation();
+  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex items-center justify-center p-4 sm:p-6">
@@ -447,6 +636,50 @@ export default function App() {
             </div>
           )}
 
+          {/* Optional personal info check — never leaves the browser, not stored */}
+          <button
+            onClick={() => setShowPersonalInfo(!showPersonalInfo)}
+            className="mt-3 inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-purple-300 bg-purple-500/10 border border-purple-500/30 rounded-lg hover:bg-purple-500/20 hover:border-purple-500/50 transition-all"
+          >
+            <UserCheck className="w-3.5 h-3.5" />
+            {showPersonalInfo ? "Hide personal info check" : "Check against personal info"}
+          </button>
+          {!showPersonalInfo && (
+            <p className="mt-1 text-[11px] text-slate-500">
+              Optional — stays in your browser, never sent or saved
+            </p>
+          )}
+
+          {showPersonalInfo && (
+            <div className="mt-2 p-3 bg-slate-800/40 border border-slate-700/50 rounded-lg space-y-2">
+              {Object.keys(personalInfo).map((label) => (
+                <input
+                  key={label}
+                  type="text"
+                  value={personalInfo[label]}
+                  onChange={(e) =>
+                    setPersonalInfo((prev) => ({ ...prev, [label]: e.target.value }))
+                  }
+                  placeholder={label}
+                  className="w-full px-3 py-2 text-sm text-white placeholder-slate-500 bg-slate-800/60 border border-slate-700/60 rounded-lg outline-none focus:border-blue-500/50"
+                />
+              ))}
+              <p className="text-xs text-slate-500">
+                Used only to flag if your password contains this info — never sent anywhere or saved.
+              </p>
+            </div>
+          )}
+
+          {personalMatches.length > 0 && (
+            <div className="mt-3 flex items-start gap-2 px-3 py-2 bg-rose-500/10 border border-rose-500/20 rounded-lg text-sm">
+              <ShieldX className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
+              <span className="text-rose-300">
+                Your password contains your {personalMatches.join(" and ")} — this is one of the
+                most common real-world weaknesses attackers exploit first.
+              </span>
+            </div>
+          )}
+
           {password && (
             <div className="mt-6">
               <div className="flex items-center justify-between mb-2.5">
@@ -490,6 +723,12 @@ export default function App() {
                       Score capped at {score}/10 despite higher raw entropy — reason: {breakdown.capReason}.
                       Real attackers check for these patterns before brute-forcing, so they're treated as
                       an automatic weakness regardless of length.
+                    </p>
+                  )}
+                  {personalMatches.length > 0 && (
+                    <p className="text-rose-400/90">
+                      Score also capped at 3/10 max — this password contains personal info you flagged
+                      ({personalMatches.join(", ")}), which real attackers check for first.
                     </p>
                   )}
                   <p className="text-slate-500 italic pt-1">
@@ -553,6 +792,58 @@ export default function App() {
                       </p>
                     </div>
                   )}
+
+                  {/* Attack simulator — visual demo only, no real cracking happens */}
+                  <div className="mt-3">
+                    {!attackRunning && attackResult === null && (
+                      <button
+                        onClick={runAttackSimulation}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg hover:bg-amber-500/20 hover:border-amber-500/50 transition-all shadow-sm shadow-amber-500/10"
+                      >
+                        <Zap className="w-3.5 h-3.5" />
+                        Simulate an attack
+                      </button>
+                    )}
+
+                    {(attackRunning || attackResult !== null) && (
+                      <div className={`p-3 rounded-lg border text-sm ${
+                        attackResult === "cracked"
+                          ? "bg-rose-500/10 border-rose-500/20"
+                          : attackResult === "survived"
+                          ? "bg-emerald-500/10 border-emerald-500/20"
+                          : "bg-slate-800/60 border-slate-700/50"
+                      }`}>
+                        <div className="flex items-center gap-2 text-xs text-slate-400 mb-1">
+                          <Zap className="w-3.5 h-3.5" />
+                          {attackRunning ? "Simulating brute-force attempts..." : "Simulation complete"}
+                        </div>
+                        <p className="font-mono text-slate-200 text-xs">
+                          {formatGuessCount(attackGuesses)} guesses attempted
+                        </p>
+                        {attackResult === "cracked" && (
+                          <p className="mt-1.5 text-rose-300 font-medium flex items-center gap-1.5">
+                            <ShieldX className="w-4 h-4" /> Cracked — this password wouldn't survive real attacks
+                          </p>
+                        )}
+                        {attackResult === "survived" && (
+                          <p className="mt-1.5 text-emerald-300 font-medium flex items-center gap-1.5">
+                            <ShieldCheck className="w-4 h-4" /> Still uncracked at simulation end — estimated {crackInfo.display} at real attack speed
+                          </p>
+                        )}
+                        {attackResult !== null && (
+                          <button
+                            onClick={stopAttackSimulation}
+                            className="mt-2 text-xs text-slate-500 hover:text-slate-300 underline decoration-dotted"
+                          >
+                            Reset
+                          </button>
+                        )}
+                        <p className="mt-1.5 text-[11px] text-slate-500 italic">
+                          Animation is time-compressed for demonstration — no real cracking attempt is made.
+                        </p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -714,6 +1005,21 @@ export default function App() {
               </div>
               <p className="text-sm text-slate-500">
                 Start typing above to check your password strength
+              </p>
+            </div>
+          )}
+          {password && (
+            <div className="mt-6 pt-4 border-t border-slate-700/50 flex flex-col items-center gap-2">
+              <button
+                onClick={generateReport}
+                className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-gradient-to-r from-blue-500 to-cyan-500 rounded-lg hover:from-blue-400 hover:to-cyan-400 transition-all shadow-md shadow-blue-500/20"
+              >
+                <Download className="w-4 h-4" />
+                Download security report
+              </button>
+              <p className="text-[11px] text-slate-500 text-center max-w-xs">
+                The report only includes your strength score, estimated crack time, character
+                types used, and feedback — never the actual password.
               </p>
             </div>
           )}
