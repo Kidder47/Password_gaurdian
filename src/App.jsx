@@ -205,7 +205,7 @@ function suggestPasswords(pw, count = 3) {
 
     // Guarantee minimum length of 8 by padding with random alphanumeric characters
     const padChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    while (suggestion.length < 8) {
+    while (suggestion.length < 12) {
       suggestion += padChars[Math.floor(Math.random() * padChars.length)];
     }
 
@@ -329,6 +329,173 @@ function estimateCrackTime(pw) {
   return { display, poolSize, entropyBits, guessesPerSecond, isDictionaryHit, combinations };
 }
 
+function getPasswordHealthChecks(pw, personalInfo, personalMatches) {
+  if (!pw) {
+    return [
+      { label: "Has uppercase letters", passed: false, detail: "Add at least one uppercase letter to broaden the character pool." },
+      { label: "Has lowercase letters", passed: false, detail: "Include at least one lowercase letter." },
+      { label: "Has numbers", passed: false, detail: "Numbers add another layer of variety." },
+      { label: "Has symbols", passed: false, detail: "Symbols make the password harder to guess." },
+      { label: "At least 12 characters", passed: false, detail: "Longer passwords dramatically increase the search space." },
+      { label: "Avoids common passwords", passed: false, detail: "Steer clear of dictionary words and common defaults." },
+      { label: "Avoids repeated or sequential patterns", passed: false, detail: "Repeated characters and sequences are easier to predict." },
+      { label: "Does not contain personal information", passed: false, detail: "A password should not include names, birthdays, or nicknames." },
+    ];
+  }
+
+  const hasLower = /[a-z]/.test(pw);
+  const hasUpper = /[A-Z]/.test(pw);
+  const hasDigit = /[0-9]/.test(pw);
+  const hasSymbol = /[^a-zA-Z0-9]/.test(pw);
+  const hasMinLength = pw.length >= 12;
+  const lower = pw.toLowerCase();
+  const commonPasswordHit = isCommonPasswordPattern(pw);
+  const repeatedPattern = /(.)\1{2,}/.test(pw);
+
+  const sequences = ["0123456789", "abcdefghijklmnopqrstuvwxyz", "qwertyuiop"];
+  let sequentialPattern = false;
+  for (const seq of sequences) {
+    for (let i = 0; i <= seq.length - 4; i++) {
+      if (lower.includes(seq.slice(i, i + 4))) {
+        sequentialPattern = true;
+        break;
+      }
+    }
+    if (sequentialPattern) break;
+  }
+
+  return [
+    {
+      label: "Has uppercase letters",
+      passed: hasUpper,
+      detail: hasUpper ? "Uppercase characters are present." : "Add at least one uppercase letter to broaden the character pool.",
+    },
+    {
+      label: "Has lowercase letters",
+      passed: hasLower,
+      detail: hasLower ? "Lowercase characters are present." : "Include at least one lowercase letter.",
+    },
+    {
+      label: "Has numbers",
+      passed: hasDigit,
+      detail: hasDigit ? "Numbers are included." : "Add a number so the password has more possible combinations.",
+    },
+    {
+      label: "Has symbols",
+      passed: hasSymbol,
+      detail: hasSymbol ? "Symbols are included." : "Add a symbol like !, @, #, or $.",
+    },
+    {
+      label: "At least 12 characters",
+      passed: hasMinLength,
+      detail: hasMinLength ? "This exceeds the 12-character target." : `Add ${12 - pw.length} more character${pw.length >= 11 ? "" : "s"} to reach 12 characters.`,
+    },
+    {
+      label: "Avoids common passwords",
+      passed: !commonPasswordHit,
+      detail: commonPasswordHit ? "This matches a common or dictionary-style password pattern." : "This does not resemble a common password pattern.",
+    },
+    {
+      label: "Avoids repeated or sequential patterns",
+      passed: !repeatedPattern && !sequentialPattern,
+      detail: repeatedPattern || sequentialPattern
+        ? "Repeated characters or obvious sequences make it easier to guess."
+        : "No obvious repeats or sequences were detected.",
+    },
+    {
+      label: "Does not contain personal information",
+      passed: personalMatches.length === 0,
+      detail: personalMatches.length > 0
+        ? `Contains personal info you flagged: ${personalMatches.join(", ")}`
+        : "No personal info was detected in the password.",
+    },
+  ];
+}
+
+function getEntropyVisualizationData(pw, breakdown) {
+  if (!pw) {
+    return {
+      bits: 0,
+      percent: 0,
+      combinationsText: "0",
+      label: "No input",
+      explanation: "Start typing to see how length and variety expand the search space.",
+    };
+  }
+
+  const bits = Math.max(0, breakdown.adjustedEntropyBits);
+  const combinations = Math.pow(breakdown.poolSize || 1, pw.length);
+  const percent = Math.min(100, Math.max(8, (bits / 160) * 100));
+  const label = bits < 40 ? "Low" : bits < 80 ? "Moderate" : bits < 120 ? "High" : "Very high";
+  const explanation = pw.length >= 12
+    ? "Longer passwords create exponentially more combinations, so every extra character matters."
+    : "Adding more characters and avoiding predictable patterns makes the password much harder to brute-force.";
+
+  return {
+    bits,
+    percent,
+    combinationsText: formatGuessCount(combinations),
+    label,
+    explanation,
+  };
+}
+
+function getScoreBreakdown(pw, personalMatches, breakdown, score) {
+  if (!pw) return [];
+
+  const lengthScore = Math.max(1, Math.min(10, Math.round((Math.min(pw.length, 24) / 24) * 10)));
+  const varietyScore = Math.max(1, Math.min(10, Math.round(((breakdown.poolSize || 1) / 94) * 10)));
+  const randomnessScore = Math.max(1, Math.min(10, Math.round(breakdown.adjustedEntropyBits / 10)));
+  const dictionaryScore = personalMatches.length > 0
+    ? 1
+    : isCommonPasswordPattern(pw)
+      ? 2
+      : Math.max(3, Math.min(10, Math.round((score + varietyScore) / 2)));
+  const personalSafetyScore = personalMatches.length > 0 ? 1 : (pw.length >= 12 ? 10 : 7);
+  const patternScore = /(.)\1{2,}/.test(pw) || /0123456789|abcdefghijklmnopqrstuvwxyz|qwertyuiop/.test(pw.toLowerCase())
+    ? 2
+    : Math.max(4, Math.min(10, Math.round((randomnessScore + varietyScore) / 2)));
+
+  return [
+    {
+      title: "Length score",
+      value: lengthScore,
+      tone: lengthScore >= 8 ? "good" : lengthScore >= 5 ? "fair" : "weak",
+      reason: pw.length >= 12 ? "The password is long enough to make brute-force guessing far more expensive." : "Adding a few more characters would dramatically improve the search space.",
+    },
+    {
+      title: "Character variety score",
+      value: varietyScore,
+      tone: varietyScore >= 8 ? "good" : varietyScore >= 5 ? "fair" : "weak",
+      reason: breakdown.poolSize >= 70 ? "The password uses a broad mix of character types." : "This password uses fewer character classes, which weakens its complexity.",
+    },
+    {
+      title: "Randomness score",
+      value: randomnessScore,
+      tone: randomnessScore >= 8 ? "good" : randomnessScore >= 5 ? "fair" : "weak",
+      reason: breakdown.adjustedEntropyBits >= 100 ? "The structure looks random enough to resist simple guessing." : "Entropy is still modest, so a longer or less predictable password would be stronger.",
+    },
+    {
+      title: "Dictionary attack resistance",
+      value: dictionaryScore,
+      tone: dictionaryScore >= 8 ? "good" : dictionaryScore >= 5 ? "fair" : "weak",
+      reason: dictionaryScore <= 2 ? "Common-word and dictionary-style patterns are easy for attackers to try first." : "This does not look like a typical dictionary hit.",
+    },
+    {
+      title: "Personal information safety",
+      value: personalSafetyScore,
+      tone: personalSafetyScore >= 8 ? "good" : personalSafetyScore >= 5 ? "fair" : "weak",
+      reason: personalMatches.length > 0 ? "Personal details make the password far more guessable." : "No personal data was detected in the password.",
+    },
+    {
+      title: "Pattern detection score",
+      value: patternScore,
+      tone: patternScore >= 8 ? "good" : patternScore >= 5 ? "fair" : "weak",
+      reason: /(.)\1{2,}/.test(pw) || /0123456789|abcdefghijklmnopqrstuvwxyz|qwertyuiop/.test(pw.toLowerCase()) ? "Repeated characters or sequences are a common weakness." : "The password avoids obvious repeat and sequence patterns.",
+    },
+  ];
+}
+
 // ---- Strength label + color helpers ----
 function getStrengthMeta(score) {
   if (score === 0) return { label: "Empty", color: "bg-slate-600", textColor: "text-slate-400", icon: ShieldX, ring: "ring-slate-500/20" };
@@ -363,6 +530,8 @@ export default function App() {
   const [attackRunning, setAttackRunning] = useState(false);
   const [attackGuesses, setAttackGuesses] = useState(0);
   const [attackResult, setAttackResult] = useState(null); // "cracked" | "survived" | null
+  const [attackLog, setAttackLog] = useState([]);
+  const [attackStage, setAttackStage] = useState("idle");
 
   const { score: baseScore, feedback, breakdown } = scorePassword(password);
   const personalMatches = checkPersonalInfoCollisions(password, personalInfo);
@@ -372,6 +541,9 @@ export default function App() {
   const crackInfo = personalMatches.length > 0
     ? { ...estimateCrackTime(password), display: "Instantly", isDictionaryHit: true }
     : estimateCrackTime(password);
+  const healthChecks = getPasswordHealthChecks(password, personalInfo, personalMatches);
+  const entropyStats = getEntropyVisualizationData(password, breakdown || { adjustedEntropyBits: 0, poolSize: 1 });
+  const breakdownCards = getScoreBreakdown(password, personalMatches, breakdown || { adjustedEntropyBits: 0, poolSize: 1 }, score);
 
   function regenerateSuggestions(pw) {
     setSuggestions(
@@ -494,13 +666,10 @@ export default function App() {
     setAttackRunning(false);
     setAttackGuesses(0);
     setAttackResult(null);
+    setAttackLog([]);
+    setAttackStage("idle");
   }
 
-  // Runs a visual (time-compressed) simulation of a brute-force attack.
-  // The counter animates rapidly regardless of actual password strength —
-  // what differs is whether it lands on "cracked" or "still secure" at the
-  // end, based on the real crack-time estimate. This is a demonstration,
-  // not a real attack — it never tries to actually guess anything.
   function runAttackSimulation() {
     if (!password) return;
     stopAttackSimulation();
@@ -512,30 +681,53 @@ export default function App() {
     const willCrack = info.isDictionaryHit || info.display.includes("second") ||
       info.display.includes("minute") || info.display.includes("hour") || info.display === "Instantly";
 
-    // Target guess count: for dictionary hits, attackers find it almost
-    // immediately from a wordlist (not by counting through combinations),
-    // so use a small realistic number instead of the full brute-force space.
-    // Otherwise, ramp toward the ACTUAL number of combinations this password
-    // requires — so the animation reflects this specific password, not a
-    // fixed generic number.
     const target = info.isDictionaryHit
       ? Math.floor(50 + Math.random() * 2000)
       : Math.max(info.combinations, 10);
     const logTarget = Math.log10(target);
 
+    const starterLines = [
+      "[sim] Initializing fake terminal session...",
+      `[sim] Target length: ${password.length} chars`,
+      "[sim] Stage 1/4 — scanning password structure",
+    ];
+    setAttackLog(starterLines);
+    setAttackStage("Scanning password");
     setAttackRunning(true);
     setAttackResult(null);
-    const durationMs = 2500;
-    const stepMs = 40;
+
+    const durationMs = 2600;
+    const stepMs = 45;
     const steps = durationMs / stepMs;
     let step = 0;
 
     attackIntervalRef.current = setInterval(() => {
       step++;
-      // Ramp exponentially in log space so it visually accelerates, but
-      // lands exactly on the real target guess count at the end
+      const progress = step / steps;
+      let nextStage = "Scanning password";
+      if (progress > 0.25) nextStage = "Checking common passwords";
+      if (progress > 0.5) nextStage = "Testing patterns";
+      if (progress > 0.75) nextStage = "Running brute force simulation";
+
       const count = Math.floor(Math.pow(10, logTarget * (step / steps)));
+      const fakeGuesses = [
+        '"password123"',
+        '"P@ssw0rd!"',
+        '"Welcome2024"',
+        '"Qwerty123!"',
+        '"Abcd1234!"',
+      ];
+      const guess = fakeGuesses[(step + password.length) % fakeGuesses.length];
+      const line = progress >= 1
+        ? `> Final attempt: ${guess}`
+        : `[sim] ${nextStage}: tried ${guess}`;
+
+      setAttackStage(nextStage);
       setAttackGuesses(count);
+      setAttackLog((prev) => {
+        const next = [...prev, line];
+        return next.slice(-7);
+      });
 
       if (step >= steps) {
         clearInterval(attackIntervalRef.current);
@@ -543,6 +735,12 @@ export default function App() {
         setAttackRunning(false);
         setAttackGuesses(target);
         setAttackResult(willCrack ? "cracked" : "survived");
+        setAttackLog((prev) => [
+          ...prev,
+          willCrack
+            ? "[sim] Result: Password cracked"
+            : "[sim] Result: Attack failed — password survived",
+        ]);
       }
     }, stepMs);
   }
@@ -681,7 +879,7 @@ export default function App() {
           )}
 
           {password && (
-            <div className="mt-6">
+            <div className="mt-6 space-y-4">
               <div className="flex items-center justify-between mb-2.5">
                 <div className="flex items-center gap-2">
                   <div className={`flex items-center justify-center w-8 h-8 rounded-lg bg-slate-800/60 ring-1 ${meta.ring}`}>
@@ -749,6 +947,66 @@ export default function App() {
                 ))}
               </div>
 
+              <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-3 shadow-inner shadow-slate-950/30">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <p className="text-sm font-semibold text-white">Password health checklist</p>
+                    <p className="text-xs text-slate-400">Live checks update as you type</p>
+                  </div>
+                  <div className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${healthChecks.filter((item) => item.passed).length >= 6 ? "bg-emerald-500/10 text-emerald-300" : "bg-amber-500/10 text-amber-300"}`}>
+                    {healthChecks.filter((item) => item.passed).length}/{healthChecks.length} passed
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  {healthChecks.map((item) => (
+                    <div key={item.label} className={`flex items-start gap-2 rounded-lg border px-3 py-2 ${item.passed ? "border-emerald-500/20 bg-emerald-500/10" : "border-slate-700/60 bg-slate-900/40"}`}>
+                      {item.passed ? (
+                        <CheckCircle2 className="mt-0.5 w-4 h-4 text-emerald-400" />
+                      ) : (
+                        <AlertTriangle className="mt-0.5 w-4 h-4 text-amber-400/80" />
+                      )}
+                      <div>
+                        <p className={`text-sm ${item.passed ? "text-emerald-300" : "text-slate-300"}`}>{item.label}</p>
+                        <p className="text-[11px] text-slate-400">{item.detail}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-3 shadow-inner shadow-slate-950/30">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <p className="text-sm font-semibold text-white">Live entropy visualization</p>
+                    <p className="text-xs text-slate-400">More length and randomness raise the search space quickly</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-lg font-semibold text-white">{entropyStats.bits.toFixed(0)} bits</p>
+                    <p className="text-[11px] text-slate-400">Entropy</p>
+                  </div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-slate-700/60">
+                  <div className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-blue-500 to-emerald-500 transition-all duration-500" style={{ width: `${entropyStats.percent}%` }} />
+                </div>
+                <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+                  <span>{entropyStats.label}</span>
+                  <span>~{entropyStats.combinationsText} combinations</span>
+                </div>
+                <p className="mt-2 text-xs text-slate-400">{entropyStats.explanation}</p>
+              </div>
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                {breakdownCards.map((card) => (
+                  <div key={card.title} className={`rounded-xl border p-3 ${card.tone === "good" ? "border-emerald-500/20 bg-emerald-500/10" : card.tone === "fair" ? "border-amber-500/20 bg-amber-500/10" : "border-rose-500/20 bg-rose-500/10"}`}>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm font-semibold text-white">{card.title}</p>
+                      <span className={`text-sm font-semibold ${card.tone === "good" ? "text-emerald-300" : card.tone === "fair" ? "text-amber-300" : "text-rose-300"}`}>{card.value}/10</span>
+                    </div>
+                    <p className="mt-2 text-[11px] text-slate-400">{card.reason}</p>
+                  </div>
+                ))}
+              </div>
+
               {crackInfo.display && (
                 <div className="mt-3">
                   <div className="flex items-center gap-1.5">
@@ -793,8 +1051,15 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Attack simulator — visual demo only, no real cracking happens */}
                   <div className="mt-3">
+                    <div className="mb-2 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Zap className="w-3.5 h-3.5 text-fuchsia-400" />
+                        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-300">Hacker terminal simulation</span>
+                      </div>
+                      <span className="text-[11px] text-slate-500">Visual demo only</span>
+                    </div>
+
                     {!attackRunning && attackResult === null && (
                       <button
                         onClick={runAttackSimulation}
@@ -806,43 +1071,39 @@ export default function App() {
                     )}
 
                     {(attackRunning || attackResult !== null) && (
-                      <div className={`p-3 rounded-lg border text-sm ${
+                      <div className={`overflow-hidden rounded-xl border text-sm ${
                         attackResult === "cracked"
                           ? "bg-rose-500/10 border-rose-500/20"
                           : attackResult === "survived"
                           ? "bg-emerald-500/10 border-emerald-500/20"
-                          : "bg-slate-800/60 border-slate-700/50"
+                          : "bg-slate-900/70 border-slate-700/50"
                       }`}>
-                        <div className="flex items-center gap-2 text-xs text-slate-400 mb-1">
-                          <Zap className="w-3.5 h-3.5" />
-                          {attackRunning ? "Simulating brute-force attempts..." : "Simulation complete"}
+                        <div className="border-b border-slate-700/60 bg-slate-950/80 px-3 py-2 text-[11px] uppercase tracking-[0.2em] text-slate-400">
+                          root@guardian:~# attack-sim
                         </div>
-                        <p className="font-mono text-slate-200 text-xs">
-                          {formatGuessCount(attackGuesses)} guesses attempted
-                        </p>
-                        {attackResult === "cracked" && (
-                          <p className="mt-1.5 text-rose-300 font-medium flex items-center gap-1.5">
-                            <ShieldX className="w-4 h-4" /> Cracked — this password wouldn't survive real attacks
-                          </p>
-                        )}
-                        {attackResult === "survived" && (
-                          <p className="mt-1.5 text-emerald-300 font-medium flex items-center gap-1.5">
-                            <ShieldCheck className="w-4 h-4" /> Still uncracked at simulation end — estimated {crackInfo.display} at real attack speed
-                          </p>
-                        )}
-                        {attackResult !== null && (
-                          <button
-                            onClick={stopAttackSimulation}
-                            className="mt-2 text-xs text-slate-500 hover:text-slate-300 underline decoration-dotted"
-                          >
-                            Reset
-                          </button>
-                        )}
-                        <p className="mt-1.5 text-[11px] text-slate-500 italic">
-                          Animation is time-compressed for demonstration — no real cracking attempt is made.
-                        </p>
+                        <div className="space-y-1 bg-slate-950/90 p-3 font-mono text-[11px] text-slate-300">
+                          <p className="text-cyan-400">[sim] Launching attack simulation...</p>
+                          <p className="text-cyan-400">[sim] Stage: {attackStage}</p>
+                          {attackLog.map((line, index) => (
+                            <p key={`${line}-${index}`} className={line.includes("cracked") || line.includes("survived") ? (line.includes("cracked") ? "text-rose-300" : "text-emerald-300") : "text-slate-300"}>
+                              {line}
+                            </p>
+                          ))}
+                          {attackRunning && <p className="animate-pulse text-emerald-400">[sim] Running...</p>}
+                        </div>
                       </div>
                     )}
+                    {attackResult !== null && (
+                      <button
+                        onClick={stopAttackSimulation}
+                        className="mt-2 text-xs text-slate-500 hover:text-slate-300 underline decoration-dotted"
+                      >
+                        Reset
+                      </button>
+                    )}
+                    <p className="mt-2 text-[11px] text-slate-500 italic">
+                      The terminal sequence is a visual simulation of how attackers progress through shared guesses and pattern checks.
+                    </p>
                   </div>
                 </div>
               )}
